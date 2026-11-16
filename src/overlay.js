@@ -905,6 +905,7 @@
     scratch.width = bitmap.width;
     scratch.height = rows;
     const context = scratch.getContext("2d", { willReadFrequently: true });
+    context.imageSmoothingEnabled = false;
     // Negative y shifts the strip up, so row `top` lands on row 0 of the scratch.
     context.drawImage(bitmap, 0, -top);
 
@@ -929,18 +930,21 @@
     };
   }
 
-  // How different two rows are, on average. Returns null if either row is out of
-  // range, so callers can tell "no answer" from "identical".
+  // How different two rows are, on average across RGB channels. Returns null if either
+  // row is out of range, so callers can tell "no answer" from "identical".
   function rowDifference(a, aRow, b, bRow) {
     if (aRow < 0 || aRow >= a.height || bRow < 0 || bRow >= b.height) return null;
 
     const width = Math.min(a.width, b.width);
     let total = 0;
     let count = 0;
-    for (let x = 0; x < width; x += 8) {
-      const left = a.data[(aRow * a.width + x) * 4];
-      const right = b.data[(bRow * b.width + x) * 4];
-      total += left > right ? left - right : right - left;
+    for (let x = 0; x < width; x += 4) {
+      const idxA = (aRow * a.width + x) * 4;
+      const idxB = (bRow * b.width + x) * 4;
+      const diffR = Math.abs(a.data[idxA] - b.data[idxB]);
+      const diffG = Math.abs(a.data[idxA + 1] - b.data[idxB + 1]);
+      const diffB = Math.abs(a.data[idxA + 2] - b.data[idxB + 2]);
+      total += (diffR + diffG + diffB) / 3;
       count++;
     }
     return count === 0 ? null : total / count;
@@ -952,8 +956,11 @@
     let minimum = 255;
     let maximum = 0;
     for (let y = 0; y < band.height; y += 2) {
-      for (let x = 0; x < band.width; x += 8) {
-        const value = band.data[(y * band.width + x) * 4];
+      for (let x = 0; x < band.width; x += 4) {
+        const idx = (y * band.width + x) * 4;
+        const value = Math.round(
+          0.299 * band.data[idx] + 0.587 * band.data[idx + 1] + 0.114 * band.data[idx + 2]
+        );
         if (value < minimum) minimum = value;
         if (value > maximum) maximum = value;
       }
@@ -961,7 +968,7 @@
     return maximum - minimum;
   }
 
-  // Average difference between a band and the tall canvas, if the band were placed at
+  // Average difference between a band and the tall canvas across RGB, if the band were placed at
   // `candidateY`. Lower is a better match; 0 would be identical.
   function bandError(band, region, candidateY) {
     let total = 0;
@@ -969,10 +976,13 @@
     for (let y = 0; y < band.height; y += 2) {
       const regionRow = candidateY + y - region.origin;
       if (regionRow < 0 || regionRow >= region.height) return Infinity;
-      for (let x = 0; x < band.width; x += 8) {
-        const a = band.data[(y * band.width + x) * 4];
-        const b = region.data[(regionRow * region.width + x) * 4];
-        total += a > b ? a - b : b - a;
+      for (let x = 0; x < band.width; x += 4) {
+        const idxA = (y * band.width + x) * 4;
+        const idxB = (regionRow * region.width + x) * 4;
+        const diffR = Math.abs(band.data[idxA] - region.data[idxB]);
+        const diffG = Math.abs(band.data[idxA + 1] - region.data[idxB + 1]);
+        const diffB = Math.abs(band.data[idxA + 2] - region.data[idxB + 2]);
+        total += (diffR + diffG + diffB) / 3;
         count++;
       }
     }
@@ -1254,18 +1264,29 @@
   async function cropColumn(dataUrl, dpr, cropTop, cropBottom) {
     // fetch() reads a data: URL happily, and gives us a blob without any string work.
     const blob = await (await fetch(dataUrl)).blob();
-    // createImageBitmap is used rather than an <img> with an onload handler: it can be
-    // awaited directly, and it can crop while decoding.
-    const shot = await createImageBitmap(blob);
+    // Decode without premultiplying alpha or forced color conversion, ensuring original
+    // subpixel font rendering and antialiasing are preserved exactly.
+    const shot = await createImageBitmap(blob, {
+      premultiplyAlpha: "none",
+      colorSpaceConversion: "none",
+    });
+
+    // Derive the exact pixel scale from the captured image itself to avoid any
+    // floating-point DPR drift between the viewport and physical screen buffer.
+    const scaleX = shot.width / window.innerWidth;
+    const scaleY = shot.height / window.innerHeight;
 
     // Round once, then clamp, so a half-pixel of rounding can never ask for a region
     // that falls outside the image (which would throw).
-    const x = clamp(Math.round(box.left * dpr), 0, shot.width);
-    const y = clamp(Math.round(cropTop * dpr), 0, shot.height);
-    const width = clamp(Math.round(box.width * dpr), 1, shot.width - x);
-    const height = clamp(Math.round((cropBottom - cropTop) * dpr), 1, shot.height - y);
+    const x = clamp(Math.round(box.left * scaleX), 0, shot.width);
+    const y = clamp(Math.round(cropTop * scaleY), 0, shot.height);
+    const width = clamp(Math.round(box.width * scaleX), 1, shot.width - x);
+    const height = clamp(Math.round((cropBottom - cropTop) * scaleY), 1, shot.height - y);
 
-    const piece = await createImageBitmap(shot, x, y, width, height);
+    const piece = await createImageBitmap(shot, x, y, width, height, {
+      premultiplyAlpha: "none",
+      colorSpaceConversion: "none",
+    });
     shot.close(); // free the full-screen copy straight away; these are large
     return piece;
   }
@@ -1310,14 +1331,98 @@
     if (remaining > 0) await wait(remaining);
   }
 
+  // --- PNG physical resolution (DPI) metadata ---------------------------------
+  // HTML Canvas exports PNG without physical resolution (pHYs) chunks, defaulting
+  // to 96 DPI. On High-DPI displays (1.25x, 1.5x, 2x), target apps (OneNote, Slack,
+  // Discord, Word) assume the image is 96 DPI and violently downscale it with
+  // low-quality filters. Injecting the standard PNG pHYs chunk embeds the exact
+  // pixel density so apps paste and render at original 1:1 retina crispness.
+
+  const CRC_TABLE = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    CRC_TABLE[n] = c;
+  }
+
+  function crc32(buffer, offset, length) {
+    let crc = 0xffffffff;
+    for (let i = offset; i < offset + length; i++) {
+      crc = CRC_TABLE[(crc ^ buffer[i]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function injectPhysChunk(arrayBuffer, dpr) {
+    const bytes = new Uint8Array(arrayBuffer);
+    if (bytes.length < 33) return arrayBuffer;
+    // Check PNG signature: 89 50 4E 47 0D 0A 1A 0A
+    if (
+      bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4e || bytes[3] !== 0x47 ||
+      bytes[4] !== 0x0d || bytes[5] !== 0x0a || bytes[6] !== 0x1a || bytes[7] !== 0x0a
+    ) {
+      return arrayBuffer;
+    }
+
+    // Don't re-insert if pHYs chunk already exists
+    for (let i = 8; i < bytes.length - 8; i++) {
+      if (
+        bytes[i] === 0x70 && bytes[i + 1] === 0x48 &&
+        bytes[i + 2] === 0x59 && bytes[i + 3] === 0x73
+      ) {
+        return arrayBuffer;
+      }
+    }
+
+    // IHDR chunk total size: 4 (len) + 4 (type) + ihdrDataLen + 4 (crc)
+    const ihdrDataLen = (bytes[8] << 24) | (bytes[9] << 16) | (bytes[10] << 8) | bytes[11];
+    const insertOffset = 8 + 4 + 4 + ihdrDataLen + 4;
+    if (insertOffset > bytes.length) return arrayBuffer;
+
+    // 96 CSS DPI * dpr converted to pixels per meter (1 inch = 0.0254m)
+    const ppm = Math.round((96 * (dpr || 1)) / 0.0254);
+
+    const phys = new Uint8Array(21);
+    const view = new DataView(phys.buffer);
+    view.setUint32(0, 9); // data length = 9 bytes
+    phys[4] = 0x70; // 'p'
+    phys[5] = 0x48; // 'H'
+    phys[6] = 0x59; // 'y'
+    phys[7] = 0x73; // 's'
+    view.setUint32(8, ppm);  // X pixels per meter
+    view.setUint32(12, ppm); // Y pixels per meter
+    phys[16] = 1;            // unit: metre
+
+    // CRC covers chunk type and data (13 bytes from index 4 to 16)
+    view.setUint32(17, crc32(phys, 4, 13));
+
+    const result = new Uint8Array(bytes.length + 21);
+    result.set(bytes.subarray(0, insertOffset), 0);
+    result.set(phys, insertOffset);
+    result.set(bytes.subarray(insertOffset), insertOffset + 21);
+
+    return result.buffer;
+  }
+
   // --- Saving the result ------------------------------------------------------
 
-  // Turns a canvas into a PNG blob.
-  function canvasToBlob(canvas) {
+  // Turns a canvas into a PNG blob with physical DPI metadata embedded.
+  function canvasToBlob(canvas, dpr = 1) {
     return new Promise((resolve, reject) => {
-      canvas.toBlob((blob) => {
-        if (blob) resolve(blob);
-        else reject(new Error("the browser could not turn the canvas into a PNG"));
+      canvas.toBlob(async (blob) => {
+        if (!blob) {
+          reject(new Error("the browser could not turn the canvas into a PNG"));
+          return;
+        }
+        try {
+          const buffer = await blob.arrayBuffer();
+          const enhanced = injectPhysChunk(buffer, dpr);
+          resolve(new Blob([enhanced], { type: "image/png" }));
+        } catch {
+          resolve(blob);
+        }
       }, "image/png");
     });
   }
@@ -1573,24 +1678,32 @@
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
-    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const isP3 = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(color-gamut: p3)").matches;
+    const colorSpace = isP3 ? "display-p3" : "srgb";
+    const context = canvas.getContext("2d", { willReadFrequently: true, colorSpace: colorSpace });
+    // Disable bilinear smoothing to preserve sharp sub-pixel font rendering and borders
+    context.imageSmoothingEnabled = false;
     // White rather than transparent: pages with no background of their own would
     // otherwise produce a PNG that looks black in some viewers.
     context.fillStyle = "#ffffff";
     context.fillRect(0, 0, width, height);
-    return { canvas: canvas, context: context, start: startY };
+    return { canvas: canvas, context: context, start: startY, colorSpace: colorSpace };
   }
 
   // Cuts a page down to the rows that actually hold image, saves it, and lets the
   // memory go. A full page is 30,000 rows — well over a hundred megabytes — so it is
   // released as soon as it has been copied rather than kept until the end.
-  async function savePage(page, endY, baseName, partNumber, multipart) {
+  async function savePage(page, endY, baseName, partNumber, multipart, dpr = 1) {
     const height = clamp(Math.round(endY - page.start), 1, page.canvas.height);
 
     const trimmed = document.createElement("canvas");
     trimmed.width = page.canvas.width;
     trimmed.height = height;
-    trimmed.getContext("2d").drawImage(page.canvas, 0, 0);
+    const trimmedCtx = trimmed.getContext("2d", {
+      colorSpace: page.colorSpace || "srgb",
+    });
+    trimmedCtx.imageSmoothingEnabled = false;
+    trimmedCtx.drawImage(page.canvas, 0, 0);
 
     page.canvas.width = 1;
     page.canvas.height = 1;
@@ -1598,7 +1711,7 @@
     const filename = multipart
       ? baseName + "-part-" + partNumber + ".png"
       : baseName + ".png";
-    const blob = await canvasToBlob(trimmed);
+    const blob = await canvasToBlob(trimmed, dpr);
     trimmed.width = 1;
     trimmed.height = 1;
 
@@ -1857,7 +1970,7 @@
           // one. The cut lands exactly on the strip's first row, so the two files join
           // with nothing missing and nothing repeated.
           if (drawY + drawHeight > page.start + page.canvas.height) {
-            saved.push(await savePage(page, drawY, baseName, saved.length + 1, true));
+            saved.push(await savePage(page, drawY, baseName, saved.length + 1, true, dpr));
             page = createPage(
               drawY,
               widthPx,
@@ -1939,7 +2052,7 @@
         lastRow0Y + Math.round((boxBottom - lastCropTop) * dpr)
       );
       saved.push(
-        await savePage(page, endY, baseName, saved.length + 1, saved.length > 0)
+        await savePage(page, endY, baseName, saved.length + 1, saved.length > 0, dpr)
       );
 
       let totalHeight = 0;
